@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -29,6 +30,7 @@ import (
 const (
 	name                   = "awslogs"
 	regionKey              = "awslogs-region"
+	endpointKey            = "awslogs-endpoint"
 	regionEnvKey           = "AWS_REGION"
 	logGroupKey            = "awslogs-group"
 	logStreamKey           = "awslogs-stream"
@@ -37,7 +39,11 @@ const (
 	datetimeFormatKey      = "awslogs-datetime-format"
 	multilinePatternKey    = "awslogs-multiline-pattern"
 	credentialsEndpointKey = "awslogs-credentials-endpoint"
-	batchPublishFrequency  = 5 * time.Second
+	forceFlushIntervalKey  = "awslogs-force-flush-interval-seconds"
+	maxBufferedEventsKey   = "awslogs-max-buffered-events"
+
+	defaultForceFlushInterval = 5 * time.Second
+	defaultMaxBufferedEvents  = 4096
 
 	// See: http://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
 	perEventBytes          = 26
@@ -45,6 +51,10 @@ const (
 	maximumLogEventsPerPut = 10000
 
 	// See: http://docs.aws.amazon.com/AmazonCloudWatch/latest/DeveloperGuide/cloudwatch_limits.html
+	// Because the events are interpreted as UTF-8 encoded Unicode, invalid UTF-8 byte sequences are replaced with the
+	// Unicode replacement character (U+FFFD), which is a 3-byte sequence in UTF-8.  To compensate for that and to avoid
+	// splitting valid UTF-8 characters into invalid byte sequences, we calculate the length of each event assuming that
+	// this replacement happens.
 	maximumBytesPerEvent = 262144 - perEventBytes
 
 	resourceAlreadyExistsCode = "ResourceAlreadyExistsException"
@@ -58,15 +68,27 @@ const (
 )
 
 type logStream struct {
-	logStreamName    string
-	logGroupName     string
-	logCreateGroup   bool
-	multilinePattern *regexp.Regexp
-	client           api
-	messages         chan *logger.Message
-	lock             sync.RWMutex
-	closed           bool
-	sequenceToken    *string
+	logStreamName      string
+	logGroupName       string
+	logCreateGroup     bool
+	logNonBlocking     bool
+	forceFlushInterval time.Duration
+	multilinePattern   *regexp.Regexp
+	client             api
+	messages           chan *logger.Message
+	lock               sync.RWMutex
+	closed             bool
+	sequenceToken      *string
+}
+
+type logStreamConfig struct {
+	logStreamName      string
+	logGroupName       string
+	logCreateGroup     bool
+	logNonBlocking     bool
+	forceFlushInterval time.Duration
+	maxBufferedEvents  int
+	multilinePattern   *regexp.Regexp
 }
 
 var _ logger.SizedLogger = &logStream{}
@@ -110,12 +132,76 @@ type eventBatch struct {
 
 // New creates an awslogs logger using the configuration passed in on the
 // context.  Supported context configuration variables are awslogs-region,
-// awslogs-group, awslogs-stream, awslogs-create-group, awslogs-multiline-pattern
-// and awslogs-datetime-format.  When available, configuration is
-// also taken from environment variables AWS_REGION, AWS_ACCESS_KEY_ID,
-// AWS_SECRET_ACCESS_KEY, the shared credentials file (~/.aws/credentials), and
-// the EC2 Instance Metadata Service.
+// awslogs-endpoint, awslogs-group, awslogs-stream, awslogs-create-group,
+// awslogs-multiline-pattern and awslogs-datetime-format.
+// When available, configuration is also taken from environment variables
+// AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, the shared credentials
+// file (~/.aws/credentials), and the EC2 Instance Metadata Service.
 func New(info logger.Info) (logger.Logger, error) {
+	containerStreamConfig, err := newStreamConfig(info)
+	if err != nil {
+		return nil, err
+	}
+	client, err := newAWSLogsClient(info)
+	if err != nil {
+		return nil, err
+	}
+
+	containerStream := &logStream{
+		logStreamName:      containerStreamConfig.logStreamName,
+		logGroupName:       containerStreamConfig.logGroupName,
+		logCreateGroup:     containerStreamConfig.logCreateGroup,
+		logNonBlocking:     containerStreamConfig.logNonBlocking,
+		forceFlushInterval: containerStreamConfig.forceFlushInterval,
+		multilinePattern:   containerStreamConfig.multilinePattern,
+		client:             client,
+		messages:           make(chan *logger.Message, containerStreamConfig.maxBufferedEvents),
+	}
+
+	creationDone := make(chan bool)
+	if containerStream.logNonBlocking {
+		go func() {
+			backoff := 1
+			maxBackoff := 32
+			for {
+				// If logger is closed we are done
+				containerStream.lock.RLock()
+				if containerStream.closed {
+					containerStream.lock.RUnlock()
+					break
+				}
+				containerStream.lock.RUnlock()
+				err := containerStream.create()
+				if err == nil {
+					break
+				}
+
+				time.Sleep(time.Duration(backoff) * time.Second)
+				if backoff < maxBackoff {
+					backoff *= 2
+				}
+				logrus.
+					WithError(err).
+					WithField("container-id", info.ContainerID).
+					WithField("container-name", info.ContainerName).
+					Error("Error while trying to initialize awslogs. Retrying in: ", backoff, " seconds")
+			}
+			close(creationDone)
+		}()
+	} else {
+		if err = containerStream.create(); err != nil {
+			return nil, err
+		}
+		close(creationDone)
+	}
+	go containerStream.collectBatch(creationDone)
+
+	return containerStream, nil
+}
+
+// Parses most of the awslogs- options and prepares a config object to be used for newing the actual stream
+// It has been formed out to ease Utest of the New above
+func newStreamConfig(info logger.Info) (*logStreamConfig, error) {
 	logGroupName := info.Config[logGroupKey]
 	logStreamName, err := loggerutils.ParseLogTag(info, "{{.FullID}}")
 	if err != nil {
@@ -124,6 +210,25 @@ func New(info logger.Info) (logger.Logger, error) {
 	logCreateGroup := false
 	if info.Config[logCreateGroupKey] != "" {
 		logCreateGroup, err = strconv.ParseBool(info.Config[logCreateGroupKey])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	logNonBlocking := info.Config["mode"] == "non-blocking"
+
+	forceFlushInterval := defaultForceFlushInterval
+	if info.Config[forceFlushIntervalKey] != "" {
+		forceFlushIntervalAsInt, err := strconv.Atoi(info.Config[forceFlushIntervalKey])
+		if err != nil {
+			return nil, err
+		}
+		forceFlushInterval = time.Duration(forceFlushIntervalAsInt) * time.Second
+	}
+
+	maxBufferedEvents := int(defaultMaxBufferedEvents)
+	if info.Config[maxBufferedEventsKey] != "" {
+		maxBufferedEvents, err = strconv.Atoi(info.Config[maxBufferedEventsKey])
 		if err != nil {
 			return nil, err
 		}
@@ -138,25 +243,17 @@ func New(info logger.Info) (logger.Logger, error) {
 		return nil, err
 	}
 
-	client, err := newAWSLogsClient(info)
-	if err != nil {
-		return nil, err
+	containerStreamConfig := &logStreamConfig{
+		logStreamName:      logStreamName,
+		logGroupName:       logGroupName,
+		logCreateGroup:     logCreateGroup,
+		logNonBlocking:     logNonBlocking,
+		forceFlushInterval: forceFlushInterval,
+		maxBufferedEvents:  maxBufferedEvents,
+		multilinePattern:   multilinePattern,
 	}
-	containerStream := &logStream{
-		logStreamName:    logStreamName,
-		logGroupName:     logGroupName,
-		logCreateGroup:   logCreateGroup,
-		multilinePattern: multilinePattern,
-		client:           client,
-		messages:         make(chan *logger.Message, 4096),
-	}
-	err = containerStream.create()
-	if err != nil {
-		return nil, err
-	}
-	go containerStream.collectBatch()
 
-	return containerStream, nil
+	return containerStreamConfig, nil
 }
 
 // Parses awslogs-multiline-pattern and awslogs-datetime-format options
@@ -211,8 +308,12 @@ var strftimeToRegex = map[string]string{
 
 // newRegionFinder is a variable such that the implementation
 // can be swapped out for unit tests.
-var newRegionFinder = func() regionFinder {
-	return ec2metadata.New(session.New())
+var newRegionFinder = func() (regionFinder, error) {
+	s, err := session.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	return ec2metadata.New(s), nil
 }
 
 // newSDKEndpoint is a variable such that the implementation
@@ -224,21 +325,27 @@ var newSDKEndpoint = credentialsEndpoint
 // User-Agent string and automatic region detection using the EC2 Instance
 // Metadata Service when region is otherwise unspecified.
 func newAWSLogsClient(info logger.Info) (api, error) {
-	var region *string
+	var region, endpoint *string
 	if os.Getenv(regionEnvKey) != "" {
 		region = aws.String(os.Getenv(regionEnvKey))
 	}
 	if info.Config[regionKey] != "" {
 		region = aws.String(info.Config[regionKey])
 	}
+	if info.Config[endpointKey] != "" {
+		endpoint = aws.String(info.Config[endpointKey])
+	}
 	if region == nil || *region == "" {
 		logrus.Info("Trying to get region from EC2 Metadata")
-		ec2MetadataClient := newRegionFinder()
+		ec2MetadataClient, err := newRegionFinder()
+		if err != nil {
+			logrus.WithError(err).Error("could not create EC2 metadata client")
+			return nil, errors.Wrap(err, "could not create EC2 metadata client")
+		}
+
 		r, err := ec2MetadataClient.Region()
 		if err != nil {
-			logrus.WithFields(logrus.Fields{
-				"error": err,
-			}).Error("Could not get region from EC2 metadata, environment, or log option")
+			logrus.WithError(err).Error("Could not get region from EC2 metadata, environment, or log option")
 			return nil, errors.New("Cannot determine region for awslogs driver")
 		}
 		region = &r
@@ -246,11 +353,16 @@ func newAWSLogsClient(info logger.Info) (api, error) {
 
 	sess, err := session.NewSession()
 	if err != nil {
-		return nil, errors.New("Failed to create a service client session for for awslogs driver")
+		return nil, errors.New("Failed to create a service client session for awslogs driver")
 	}
 
 	// attach region to cloudwatchlogs config
 	sess.Config.Region = region
+
+	// attach endpoint to cloudwatchlogs config
+	if endpoint != nil {
+		sess.Config.Endpoint = endpoint
+	}
 
 	if uri, ok := info.Config[credentialsEndpointKey]; ok {
 		logrus.Debugf("Trying to get credentials from awslogs-credentials-endpoint")
@@ -296,9 +408,18 @@ func (l *logStream) BufSize() int {
 func (l *logStream) Log(msg *logger.Message) error {
 	l.lock.RLock()
 	defer l.lock.RUnlock()
-	if !l.closed {
-		l.messages <- msg
+	if l.closed {
+		return errors.New("awslogs is closed")
 	}
+	if l.logNonBlocking {
+		select {
+		case l.messages <- msg:
+			return nil
+		default:
+			return errors.New("awslogs buffer is full")
+		}
+	}
+	l.messages <- msg
 	return nil
 }
 
@@ -315,19 +436,20 @@ func (l *logStream) Close() error {
 
 // create creates log group and log stream for the instance of the awslogs logging driver
 func (l *logStream) create() error {
-	if err := l.createLogStream(); err != nil {
-		if l.logCreateGroup {
-			if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == resourceNotFoundCode {
-				if err := l.createLogGroup(); err != nil {
-					return err
-				}
-				return l.createLogStream()
-			}
-		}
-		return err
+	err := l.createLogStream()
+	if err == nil {
+		return nil
 	}
-
-	return nil
+	if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == resourceNotFoundCode && l.logCreateGroup {
+		if err := l.createLogGroup(); err != nil {
+			return errors.Wrap(err, "failed to create Cloudwatch log group")
+		}
+		err = l.createLogStream()
+		if err == nil {
+			return nil
+		}
+	}
+	return errors.Wrap(err, "failed to create Cloudwatch log stream")
 }
 
 // createLogGroup creates a log group for the instance of the awslogs logging driver
@@ -401,8 +523,14 @@ var newTicker = func(freq time.Duration) *time.Ticker {
 // seconds.  When events are ready to be processed for submission to CloudWatch
 // Logs, the processEvents method is called.  If a multiline pattern is not
 // configured, log events are submitted to the processEvents method immediately.
-func (l *logStream) collectBatch() {
-	ticker := newTicker(batchPublishFrequency)
+func (l *logStream) collectBatch(created chan bool) {
+	// Wait for the logstream/group to be created
+	<-created
+	flushInterval := l.forceFlushInterval
+	if flushInterval <= 0 {
+		flushInterval = defaultForceFlushInterval
+	}
+	ticker := newTicker(flushInterval)
 	var eventBuffer []byte
 	var eventBufferTimestamp int64
 	var batch = newEventBatch()
@@ -412,7 +540,7 @@ func (l *logStream) collectBatch() {
 			// If event buffer is older than batch publish frequency flush the event buffer
 			if eventBufferTimestamp > 0 && len(eventBuffer) > 0 {
 				eventBufferAge := t.UnixNano()/int64(time.Millisecond) - eventBufferTimestamp
-				eventBufferExpired := eventBufferAge >= int64(batchPublishFrequency)/int64(time.Millisecond)
+				eventBufferExpired := eventBufferAge >= int64(flushInterval)/int64(time.Millisecond)
 				eventBufferNegative := eventBufferAge < 0
 				if eventBufferExpired || eventBufferNegative {
 					l.processEvent(batch, eventBuffer, eventBufferTimestamp)
@@ -425,7 +553,6 @@ func (l *logStream) collectBatch() {
 			if !more {
 				// Flush event buffer and release resources
 				l.processEvent(batch, eventBuffer, eventBufferTimestamp)
-				eventBuffer = eventBuffer[:0]
 				l.publishBatch(batch)
 				batch.reset()
 				return
@@ -435,15 +562,16 @@ func (l *logStream) collectBatch() {
 			}
 			line := msg.Line
 			if l.multilinePattern != nil {
-				if l.multilinePattern.Match(line) || len(eventBuffer)+len(line) > maximumBytesPerEvent {
+				lineEffectiveLen := effectiveLen(string(line))
+				if l.multilinePattern.Match(line) || effectiveLen(string(eventBuffer))+lineEffectiveLen > maximumBytesPerEvent {
 					// This is a new log event or we will exceed max bytes per event
 					// so flush the current eventBuffer to events and reset timestamp
 					l.processEvent(batch, eventBuffer, eventBufferTimestamp)
 					eventBufferTimestamp = msg.Timestamp.UnixNano() / int64(time.Millisecond)
 					eventBuffer = eventBuffer[:0]
 				}
-				// Append new line if event is less than max event size
-				if len(line) < maximumBytesPerEvent {
+				// Append newline if event is less than max event size
+				if lineEffectiveLen < maximumBytesPerEvent {
 					line = append(line, "\n"...)
 				}
 				eventBuffer = append(eventBuffer, line...)
@@ -464,16 +592,17 @@ func (l *logStream) collectBatch() {
 // batch (defined in maximumBytesPerPut).  Log messages are split by the maximum
 // bytes per event (defined in maximumBytesPerEvent).  There is a fixed per-event
 // byte overhead (defined in perEventBytes) which is accounted for in split- and
-// batch-calculations.
-func (l *logStream) processEvent(batch *eventBatch, events []byte, timestamp int64) {
-	for len(events) > 0 {
+// batch-calculations.  Because the events are interpreted as UTF-8 encoded
+// Unicode, invalid UTF-8 byte sequences are replaced with the Unicode
+// replacement character (U+FFFD), which is a 3-byte sequence in UTF-8.  To
+// compensate for that and to avoid splitting valid UTF-8 characters into
+// invalid byte sequences, we calculate the length of each event assuming that
+// this replacement happens.
+func (l *logStream) processEvent(batch *eventBatch, bytes []byte, timestamp int64) {
+	for len(bytes) > 0 {
 		// Split line length so it does not exceed the maximum
-		lineBytes := len(events)
-		if lineBytes > maximumBytesPerEvent {
-			lineBytes = maximumBytesPerEvent
-		}
-		line := events[:lineBytes]
-
+		splitOffset, lineBytes := findValidSplit(string(bytes), maximumBytesPerEvent)
+		line := bytes[:splitOffset]
 		event := wrappedEvent{
 			inputLogEvent: &cloudwatchlogs.InputLogEvent{
 				Message:   aws.String(string(line)),
@@ -484,12 +613,43 @@ func (l *logStream) processEvent(batch *eventBatch, events []byte, timestamp int
 
 		added := batch.add(event, lineBytes)
 		if added {
-			events = events[lineBytes:]
+			bytes = bytes[splitOffset:]
 		} else {
 			l.publishBatch(batch)
 			batch.reset()
 		}
 	}
+}
+
+// effectiveLen counts the effective number of bytes in the string, after
+// UTF-8 normalization.  UTF-8 normalization includes replacing bytes that do
+// not constitute valid UTF-8 encoded Unicode codepoints with the Unicode
+// replacement codepoint U+FFFD (a 3-byte UTF-8 sequence, represented in Go as
+// utf8.RuneError)
+func effectiveLen(line string) int {
+	effectiveBytes := 0
+	for _, rune := range line {
+		effectiveBytes += utf8.RuneLen(rune)
+	}
+	return effectiveBytes
+}
+
+// findValidSplit finds the byte offset to split a string without breaking valid
+// Unicode codepoints given a maximum number of total bytes.  findValidSplit
+// returns the byte offset for splitting a string or []byte, as well as the
+// effective number of bytes if the string were normalized to replace invalid
+// UTF-8 encoded bytes with the Unicode replacement character (a 3-byte UTF-8
+// sequence, represented in Go as utf8.RuneError)
+func findValidSplit(line string, maxBytes int) (splitOffset, effectiveBytes int) {
+	for offset, rune := range line {
+		splitOffset = offset
+		if effectiveBytes+utf8.RuneLen(rune) > maxBytes {
+			return splitOffset, effectiveBytes
+		}
+		effectiveBytes += utf8.RuneLen(rune)
+	}
+	splitOffset = len(line)
+	return
 }
 
 // publishBatch calls PutLogEvents for a given set of InputLogEvents,
@@ -555,7 +715,7 @@ func (l *logStream) putLogEvents(events []*cloudwatchlogs.InputLogEvent, sequenc
 	return resp.NextSequenceToken, nil
 }
 
-// ValidateLogOpt looks for awslogs-specific log options awslogs-region,
+// ValidateLogOpt looks for awslogs-specific log options awslogs-region, awslogs-endpoint
 // awslogs-group, awslogs-stream, awslogs-create-group, awslogs-datetime-format,
 // awslogs-multiline-pattern
 func ValidateLogOpt(cfg map[string]string) error {
@@ -565,10 +725,13 @@ func ValidateLogOpt(cfg map[string]string) error {
 		case logStreamKey:
 		case logCreateGroupKey:
 		case regionKey:
+		case endpointKey:
 		case tagKey:
 		case datetimeFormatKey:
 		case multilinePatternKey:
 		case credentialsEndpointKey:
+		case forceFlushIntervalKey:
+		case maxBufferedEventsKey:
 		default:
 			return fmt.Errorf("unknown log opt '%s' for %s log driver", key, name)
 		}
@@ -579,6 +742,16 @@ func ValidateLogOpt(cfg map[string]string) error {
 	if cfg[logCreateGroupKey] != "" {
 		if _, err := strconv.ParseBool(cfg[logCreateGroupKey]); err != nil {
 			return fmt.Errorf("must specify valid value for log opt '%s': %v", logCreateGroupKey, err)
+		}
+	}
+	if cfg[forceFlushIntervalKey] != "" {
+		if value, err := strconv.Atoi(cfg[forceFlushIntervalKey]); err != nil || value <= 0 {
+			return fmt.Errorf("must specify a positive integer for log opt '%s': %v", forceFlushIntervalKey, cfg[forceFlushIntervalKey])
+		}
+	}
+	if cfg[maxBufferedEventsKey] != "" {
+		if value, err := strconv.Atoi(cfg[maxBufferedEventsKey]); err != nil || value <= 0 {
+			return fmt.Errorf("must specify a positive integer for log opt '%s': %v", maxBufferedEventsKey, cfg[maxBufferedEventsKey])
 		}
 	}
 	_, datetimeFormatKeyExists := cfg[datetimeFormatKey]

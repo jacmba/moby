@@ -12,7 +12,7 @@ import (
 
 const (
 	// DefaultIpcMode is default for container's IpcMode, if not set otherwise
-	DefaultIpcMode = "shareable" // TODO: change to private
+	DefaultIpcMode = "private"
 )
 
 // Config defines the configuration of a docker daemon.
@@ -23,7 +23,6 @@ type Config struct {
 
 	// These fields are common to all unix platforms.
 	CommonUnixConfig
-
 	// Fields below here are platform specific.
 	CgroupParent         string                   `json:"cgroup-parent,omitempty"`
 	EnableSelinuxSupport bool                     `json:"selinux-enabled,omitempty"`
@@ -38,6 +37,10 @@ type Config struct {
 	ShmSize              opts.MemBytes            `json:"default-shm-size,omitempty"`
 	NoNewPrivileges      bool                     `json:"no-new-privileges,omitempty"`
 	IpcMode              string                   `json:"default-ipc-mode,omitempty"`
+	CgroupNamespaceMode  string                   `json:"default-cgroupns-mode,omitempty"`
+	// ResolvConf is the path to the configuration of the host resolver
+	ResolvConf string `json:"resolv-conf,omitempty"`
+	Rootless   bool   `json:"rootless,omitempty"`
 }
 
 // BridgeConfig stores all the bridge driver specific
@@ -82,7 +85,25 @@ func verifyDefaultIpcMode(mode string) error {
 	return nil
 }
 
+func verifyDefaultCgroupNsMode(mode string) error {
+	cm := containertypes.CgroupnsMode(mode)
+	if !cm.Valid() {
+		return fmt.Errorf("Default cgroup namespace mode (%v) is invalid. Use \"host\" or \"private\".", cm) // nolint: golint
+	}
+
+	return nil
+}
+
 // ValidatePlatformConfig checks if any platform-specific configuration settings are invalid.
 func (conf *Config) ValidatePlatformConfig() error {
-	return verifyDefaultIpcMode(conf.IpcMode)
+	if err := verifyDefaultIpcMode(conf.IpcMode); err != nil {
+		return err
+	}
+
+	return verifyDefaultCgroupNsMode(conf.CgroupNamespaceMode)
+}
+
+// IsRootless returns conf.Rootless
+func (conf *Config) IsRootless() bool {
+	return conf.Rootless
 }

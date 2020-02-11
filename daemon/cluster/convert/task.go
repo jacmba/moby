@@ -10,9 +10,6 @@ import (
 
 // TaskFromGRPC converts a grpc Task to a Task.
 func TaskFromGRPC(t swarmapi.Task) (types.Task, error) {
-	if t.Spec.GetAttachment() != nil {
-		return types.Task{}, nil
-	}
 	containerStatus := t.Status.GetContainer()
 	taskSpec, err := taskSpecFromGRPC(t.Spec)
 	if err != nil {
@@ -66,6 +63,12 @@ func TaskFromGRPC(t swarmapi.Task) (types.Task, error) {
 			TargetPort:    p.TargetPort,
 			PublishedPort: p.PublishedPort,
 		})
+	}
+
+	if t.JobIteration != nil {
+		task.JobIteration = &types.Version{
+			Index: t.JobIteration.Index,
+		}
 	}
 
 	return task, nil

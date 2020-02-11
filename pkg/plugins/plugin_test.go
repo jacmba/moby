@@ -14,8 +14,8 @@ import (
 
 	"github.com/docker/docker/pkg/plugins/transport"
 	"github.com/docker/go-connections/tlsconfig"
-	"github.com/gotestyourself/gotestyourself/assert"
 	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
 )
 
 const (
@@ -95,7 +95,7 @@ func TestPluginWithNoManifest(t *testing.T) {
 	}
 
 	mux.HandleFunc("/Plugin.Activate", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
+		if r.Method != http.MethodPost {
 			t.Fatalf("Expected POST, got %s\n", r.Method)
 		}
 

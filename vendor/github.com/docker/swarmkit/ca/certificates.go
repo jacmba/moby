@@ -2,6 +2,7 @@ package ca
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -26,17 +27,15 @@ import (
 	"github.com/cloudflare/cfssl/signer/local"
 	"github.com/docker/go-events"
 	"github.com/docker/swarmkit/api"
-	"github.com/docker/swarmkit/ca/keyutils"
 	"github.com/docker/swarmkit/ca/pkcs8"
 	"github.com/docker/swarmkit/connectionbroker"
-	"github.com/docker/swarmkit/fips"
 	"github.com/docker/swarmkit/ioutils"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -354,7 +353,8 @@ func (rca *RootCA) getKEKUpdate(ctx context.Context, leafCert *x509.Certificate,
 		defer cancel()
 		response, err := client.GetUnlockKey(ctx, &api.GetUnlockKeyRequest{})
 		if err != nil {
-			if grpc.Code(err) == codes.Unimplemented { // if the server does not support keks, return as if no encryption key was specified
+			s, _ := status.FromError(err)
+			if s.Code() == codes.Unimplemented { // if the server does not support keks, return as if no encryption key was specified
 				conn.Close(true)
 				return &KEKData{}, nil
 			}
@@ -636,7 +636,7 @@ func newLocalSigner(keyBytes, certBytes []byte, certExpiry time.Duration, rootPo
 	}
 
 	// The key should not be encrypted, but it could be in PKCS8 format rather than PKCS1
-	priv, err := keyutils.ParsePrivateKeyPEMWithPassword(keyBytes, nil)
+	priv, err := helpers.ParsePrivateKeyPEM(keyBytes)
 	if err != nil {
 		return nil, errors.Wrap(err, "malformed private key")
 	}
@@ -782,14 +782,6 @@ func CreateRootCA(rootCN string) (RootCA, error) {
 		return RootCA{}, err
 	}
 
-	// Convert key to PKCS#8 in FIPS mode
-	if fips.Enabled() {
-		key, err = pkcs8.ConvertECPrivateKeyPEM(key)
-		if err != nil {
-			return RootCA{}, err
-		}
-	}
-
 	rootCA, err := NewRootCA(cert, cert, key, DefaultNodeCertExpiration, nil)
 	if err != nil {
 		return RootCA{}, err
@@ -848,8 +840,9 @@ func GetRemoteSignedCertificate(ctx context.Context, csr []byte, rootCAPool *x50
 		stateCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		statusResponse, err := caClient.NodeCertificateStatus(stateCtx, statusRequest)
+		s, _ := status.FromError(err)
 		switch {
-		case err != nil && grpc.Code(err) != codes.DeadlineExceeded:
+		case err != nil && s.Code() != codes.DeadlineExceeded:
 			conn.Close(false)
 			// Because IssueNodeCertificate succeeded, if this call failed likely it is due to an issue with this
 			// particular connection, so we need to get another.  We should try a remote connection - the local node

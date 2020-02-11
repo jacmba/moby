@@ -1,13 +1,13 @@
 package distribution // import "github.com/docker/docker/distribution"
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"reflect"
 	"testing"
 
 	"github.com/docker/distribution"
-	"github.com/docker/distribution/context"
 	"github.com/docker/distribution/manifest/schema2"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/api/errcode"
@@ -17,7 +17,7 @@ import (
 	"github.com/docker/docker/pkg/progress"
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 )
 
 func TestGetRepositoryMountCandidates(t *testing.T) {
@@ -549,7 +549,7 @@ type mockBlobStoreWithCreate struct {
 }
 
 func (blob *mockBlobStoreWithCreate) Create(ctx context.Context, options ...distribution.BlobCreateOption) (distribution.BlobWriter, error) {
-	return nil, errcode.Errors(append([]error{errcode.ErrorCodeUnauthorized.WithMessage("unauthorized")}))
+	return nil, errcode.Errors([]error{errcode.ErrorCodeUnauthorized.WithMessage("unauthorized")})
 }
 
 type mockRepoWithBlob struct {

@@ -8,13 +8,14 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/internal/test/daemon"
-	"github.com/gotestyourself/gotestyourself/assert"
-	"github.com/gotestyourself/gotestyourself/skip"
+	"github.com/docker/docker/testutil/daemon"
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/skip"
 )
 
 func TestDaemonRestartKillContainers(t *testing.T) {
-	skip.If(t, testEnv.IsRemoteDaemon(), "cannot start daemon on remote test run")
+	skip.If(t, testEnv.IsRemoteDaemon, "cannot start daemon on remote test run")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	type testCase struct {
 		desc       string
 		config     *container.Config
@@ -22,13 +23,15 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 
 		xRunning            bool
 		xRunningLiveRestore bool
+		xStart              bool
 	}
 
-	for _, c := range []testCase{
+	for _, tc := range []testCase{
 		{
 			desc:                "container without restart policy",
 			config:              &container.Config{Image: "busybox", Cmd: []string{"top"}},
 			xRunningLiveRestore: true,
+			xStart:              true,
 		},
 		{
 			desc:                "container with restart=always",
@@ -36,6 +39,12 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 			hostConfig:          &container.HostConfig{RestartPolicy: container.RestartPolicy{Name: "always"}},
 			xRunning:            true,
 			xRunningLiveRestore: true,
+			xStart:              true,
+		},
+		{
+			desc:       "container created should not be restarted",
+			config:     &container.Config{Image: "busybox", Cmd: []string{"top"}},
+			hostConfig: &container.HostConfig{RestartPolicy: container.RestartPolicy{Name: "always"}},
 		},
 	} {
 		for _, liveRestoreEnabled := range []bool{false, true} {
@@ -48,16 +57,15 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 					d.Stop(t)
 				},
 			} {
-				t.Run(fmt.Sprintf("live-restore=%v/%s/%s", liveRestoreEnabled, c.desc, fnName), func(t *testing.T) {
-					c := c
+				t.Run(fmt.Sprintf("live-restore=%v/%s/%s", liveRestoreEnabled, tc.desc, fnName), func(t *testing.T) {
+					c := tc
 					liveRestoreEnabled := liveRestoreEnabled
 					stopDaemon := stopDaemon
 
 					t.Parallel()
 
 					d := daemon.New(t)
-					client, err := d.NewClient()
-					assert.NilError(t, err)
+					client := d.NewClientT(t)
 
 					args := []string{"--iptables=false"}
 					if liveRestoreEnabled {
@@ -72,8 +80,10 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 					assert.NilError(t, err)
 					defer client.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
 
-					err = client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
-					assert.NilError(t, err)
+					if c.xStart {
+						err = client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
+						assert.NilError(t, err)
+					}
 
 					stopDaemon(t, d)
 					d.Start(t, args...)

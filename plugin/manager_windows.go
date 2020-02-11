@@ -3,7 +3,7 @@ package plugin // import "github.com/docker/docker/plugin"
 import (
 	"fmt"
 
-	"github.com/docker/docker/plugin/v2"
+	v2 "github.com/docker/docker/plugin/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -19,7 +19,7 @@ func (pm *Manager) disable(p *v2.Plugin, c *controller) error {
 	return fmt.Errorf("Not implemented")
 }
 
-func (pm *Manager) restore(p *v2.Plugin) error {
+func (pm *Manager) restore(p *v2.Plugin, c *controller) error {
 	return fmt.Errorf("Not implemented")
 }
 

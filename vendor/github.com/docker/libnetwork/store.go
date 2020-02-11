@@ -80,30 +80,15 @@ func (c *controller) getStores() []datastore.DataStore {
 }
 
 func (c *controller) getNetworkFromStore(nid string) (*network, error) {
-	for _, store := range c.getStores() {
-		n := &network{id: nid, ctrlr: c}
-		err := store.GetObject(datastore.Key(n.Key()...), n)
-		// Continue searching in the next store if the key is not found in this store
-		if err != nil {
-			if err != datastore.ErrKeyNotFound {
-				logrus.Debugf("could not find network %s: %v", nid, err)
-			}
-			continue
-		}
-
-		ec := &endpointCnt{n: n}
-		err = store.GetObject(datastore.Key(ec.Key()...), ec)
-		if err != nil && !n.inDelete {
-			return nil, fmt.Errorf("could not find endpoint count for network %s: %v", n.Name(), err)
-		}
-
-		n.epCnt = ec
-		if n.scope == "" {
-			n.scope = store.Scope()
-		}
-		return n, nil
+	ns, err := c.getNetworksFromStore()
+	if err != nil {
+		return nil, err
 	}
-
+	for _, n := range ns {
+		if n.id == nid {
+			return n, nil
+		}
+	}
 	return nil, fmt.Errorf("network %s not found", nid)
 }
 
@@ -479,7 +464,7 @@ func (c *controller) networkCleanup() {
 	for _, n := range networks {
 		if n.inDelete {
 			logrus.Infof("Removing stale network %s (%s)", n.Name(), n.ID())
-			if err := n.delete(true); err != nil {
+			if err := n.delete(true, true); err != nil {
 				logrus.Debugf("Error while removing stale network: %v", err)
 			}
 		}

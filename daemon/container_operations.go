@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"path"
-	"runtime"
 	"strings"
 	"time"
 
@@ -31,7 +30,7 @@ var (
 	// ErrRootFSReadOnly is returned when a container
 	// rootfs is marked readonly.
 	ErrRootFSReadOnly = errors.New("container rootfs is marked read-only")
-	getPortMapInfo    = container.GetSandboxPortMapInfo
+	getPortMapInfo    = getSandboxPortMapInfo
 )
 
 func (daemon *Daemon) getDNSSearchSettings(container *container.Container) []string {
@@ -63,21 +62,13 @@ func (daemon *Daemon) buildSandboxOptions(container *container.Container) ([]lib
 
 	if container.HostConfig.NetworkMode.IsHost() {
 		sboxOptions = append(sboxOptions, libnetwork.OptionUseDefaultSandbox())
-		if len(container.HostConfig.ExtraHosts) == 0 {
-			sboxOptions = append(sboxOptions, libnetwork.OptionOriginHostsPath("/etc/hosts"))
-		}
-		if len(container.HostConfig.DNS) == 0 && len(daemon.configStore.DNS) == 0 &&
-			len(container.HostConfig.DNSSearch) == 0 && len(daemon.configStore.DNSSearch) == 0 &&
-			len(container.HostConfig.DNSOptions) == 0 && len(daemon.configStore.DNSOptions) == 0 {
-			sboxOptions = append(sboxOptions, libnetwork.OptionOriginResolvConfPath("/etc/resolv.conf"))
-		}
 	} else {
 		// OptionUseExternalKey is mandatory for userns support.
 		// But optional for non-userns support
 		sboxOptions = append(sboxOptions, libnetwork.OptionUseExternalKey())
 	}
 
-	if err = setupPathsAndSandboxOptions(container, &sboxOptions); err != nil {
+	if err = daemon.setupPathsAndSandboxOptions(container, &sboxOptions); err != nil {
 		return nil, err
 	}
 
@@ -124,6 +115,16 @@ func (daemon *Daemon) buildSandboxOptions(container *container.Container) ([]lib
 			return nil, err
 		}
 		parts := strings.SplitN(extraHost, ":", 2)
+		// If the IP Address is a string called "host-gateway", replace this
+		// value with the IP address stored in the daemon level HostGatewayIP
+		// config variable
+		if parts[1] == network.HostGatewayName {
+			gateway := daemon.configStore.HostGatewayIP.String()
+			if gateway == "" {
+				return nil, fmt.Errorf("unable to derive the IP value for host-gateway")
+			}
+			parts[1] = gateway
+		}
 		sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(parts[0], parts[1]))
 	}
 
@@ -209,7 +210,14 @@ func (daemon *Daemon) buildSandboxOptions(container *container.Container) ([]lib
 		if alias != child.Name[1:] {
 			aliasList = aliasList + " " + child.Name[1:]
 		}
-		sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(aliasList, child.NetworkSettings.Networks[defaultNetName].IPAddress))
+		ipv4 := child.NetworkSettings.Networks[defaultNetName].IPAddress
+		ipv6 := child.NetworkSettings.Networks[defaultNetName].GlobalIPv6Address
+		if ipv4 != "" {
+			sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(aliasList, ipv4))
+		}
+		if ipv6 != "" {
+			sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(aliasList, ipv6))
+		}
 		cEndpointID = child.NetworkSettings.Networks[defaultNetName].EndpointID
 		if cEndpointID != "" {
 			childEndpoints = append(childEndpoints, cEndpointID)
@@ -246,7 +254,10 @@ func (daemon *Daemon) buildSandboxOptions(container *container.Container) ([]lib
 
 func (daemon *Daemon) updateNetworkSettings(container *container.Container, n libnetwork.Network, endpointConfig *networktypes.EndpointSettings) error {
 	if container.NetworkSettings == nil {
-		container.NetworkSettings = &network.Settings{Networks: make(map[string]*network.EndpointSettings)}
+		container.NetworkSettings = &network.Settings{}
+	}
+	if container.NetworkSettings.Networks == nil {
+		container.NetworkSettings.Networks = make(map[string]*network.EndpointSettings)
 	}
 
 	if !container.HostConfig.NetworkMode.IsHost() && containertypes.NetworkMode(n.Type()).IsHost() {
@@ -288,7 +299,7 @@ func (daemon *Daemon) updateNetworkSettings(container *container.Container, n li
 }
 
 func (daemon *Daemon) updateEndpointNetworkSettings(container *container.Container, n libnetwork.Network, ep libnetwork.Endpoint) error {
-	if err := container.BuildEndpointInfo(n, ep); err != nil {
+	if err := buildEndpointInfo(container.NetworkSettings, n, ep); err != nil {
 		return err
 	}
 
@@ -362,6 +373,15 @@ func (daemon *Daemon) findAndAttachNetwork(container *container.Container, idOrN
 	if n != nil {
 		if container.Managed || !n.Info().Dynamic() {
 			return n, nil, nil
+		}
+		// Throw an error if the container is already attached to the network
+		if container.NetworkSettings.Networks != nil {
+			networkName := n.Name()
+			containerName := strings.TrimPrefix(container.Name, "/")
+			if network, ok := container.NetworkSettings.Networks[networkName]; ok && network.EndpointID != "" {
+				err := fmt.Errorf("%s is already attached to network %s", containerName, networkName)
+				return n, nil, errdefs.Conflict(err)
+			}
 		}
 	}
 
@@ -572,7 +592,7 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 			if err != nil {
 				return err
 			}
-			container.UpdateSandboxNetworkSettings(sb)
+			updateSandboxNetworkSettings(container, sb)
 			defer func() {
 				if err != nil {
 					sb.Delete()
@@ -601,9 +621,9 @@ func (daemon *Daemon) getNetworkSandbox(container *container.Container) libnetwo
 	return sb
 }
 
-// hasUserDefinedIPAddress returns whether the passed endpoint configuration contains IP address configuration
-func hasUserDefinedIPAddress(epConfig *networktypes.EndpointSettings) bool {
-	return epConfig != nil && epConfig.IPAMConfig != nil && (len(epConfig.IPAMConfig.IPv4Address) > 0 || len(epConfig.IPAMConfig.IPv6Address) > 0)
+// hasUserDefinedIPAddress returns whether the passed IPAM configuration contains IP address configuration
+func hasUserDefinedIPAddress(ipamConfig *networktypes.EndpointIPAMConfig) bool {
+	return ipamConfig != nil && (len(ipamConfig.IPv4Address) > 0 || len(ipamConfig.IPv6Address) > 0)
 }
 
 // User specified ip address is acceptable only for networks with user specified subnets.
@@ -611,9 +631,18 @@ func validateNetworkingConfig(n libnetwork.Network, epConfig *networktypes.Endpo
 	if n == nil || epConfig == nil {
 		return nil
 	}
-	if !hasUserDefinedIPAddress(epConfig) {
+	if !containertypes.NetworkMode(n.Name()).IsUserDefined() {
+		if hasUserDefinedIPAddress(epConfig.IPAMConfig) && !enableIPOnPredefinedNetwork() {
+			return runconfig.ErrUnsupportedNetworkAndIP
+		}
+		if len(epConfig.Aliases) > 0 && !serviceDiscoveryOnDefaultNetwork() {
+			return runconfig.ErrUnsupportedNetworkAndAlias
+		}
+	}
+	if !hasUserDefinedIPAddress(epConfig.IPAMConfig) {
 		return nil
 	}
+
 	_, _, nwIPv4Configs, nwIPv6Configs := n.Info().IpamConfig()
 	for _, s := range []struct {
 		ipConfigured  bool
@@ -662,14 +691,7 @@ func cleanOperationalData(es *network.EndpointSettings) {
 
 func (daemon *Daemon) updateNetworkConfig(container *container.Container, n libnetwork.Network, endpointConfig *networktypes.EndpointSettings, updateSettings bool) error {
 
-	if !containertypes.NetworkMode(n.Name()).IsUserDefined() {
-		if hasUserDefinedIPAddress(endpointConfig) && !enableIPOnPredefinedNetwork() {
-			return runconfig.ErrUnsupportedNetworkAndIP
-		}
-		if endpointConfig != nil && len(endpointConfig.Aliases) > 0 && !container.EnableServiceDiscoveryOnDefaultNetwork() {
-			return runconfig.ErrUnsupportedNetworkAndAlias
-		}
-	} else {
+	if containertypes.NetworkMode(n.Name()).IsUserDefined() {
 		addShortID := true
 		shortID := stringid.TruncateID(container.ID)
 		for _, alias := range endpointConfig.Aliases {
@@ -680,6 +702,18 @@ func (daemon *Daemon) updateNetworkConfig(container *container.Container, n libn
 		}
 		if addShortID {
 			endpointConfig.Aliases = append(endpointConfig.Aliases, shortID)
+		}
+		if container.Name != container.Config.Hostname {
+			addHostname := true
+			for _, alias := range endpointConfig.Aliases {
+				if alias == container.Config.Hostname {
+					addHostname = false
+					break
+				}
+			}
+			if addHostname {
+				endpointConfig.Aliases = append(endpointConfig.Aliases, container.Config.Hostname)
+			}
 		}
 	}
 
@@ -733,14 +767,13 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		}
 	}
 
-	err = daemon.updateNetworkConfig(container, n, endpointConfig, updateSettings)
-	if err != nil {
+	if err := daemon.updateNetworkConfig(container, n, endpointConfig, updateSettings); err != nil {
 		return err
 	}
 
 	controller := daemon.netController
 	sb := daemon.getNetworkSandbox(container)
-	createOptions, err := container.BuildCreateEndpointOptions(n, endpointConfig, sb, daemon.configStore.DNS)
+	createOptions, err := buildCreateEndpointOptions(container, n, endpointConfig, sb, daemon.configStore.DNS)
 	if err != nil {
 		return err
 	}
@@ -761,9 +794,8 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		EndpointSettings: endpointConfig,
 		IPAMOperational:  operIPAM,
 	}
-	if _, ok := container.NetworkSettings.Networks[n.ID()]; ok {
-		delete(container.NetworkSettings.Networks, n.ID())
-	}
+
+	delete(container.NetworkSettings.Networks, n.ID())
 
 	if err := daemon.updateEndpointNetworkSettings(container, n, ep); err != nil {
 		return err
@@ -779,10 +811,10 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 			return err
 		}
 
-		container.UpdateSandboxNetworkSettings(sb)
+		updateSandboxNetworkSettings(container, sb)
 	}
 
-	joinOptions, err := container.BuildJoinOptions(n)
+	joinOptions, err := buildJoinOptions(container.NetworkSettings, n)
 	if err != nil {
 		return err
 	}
@@ -798,7 +830,7 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		}
 	}
 
-	if err := container.UpdateJoinInfo(n, ep); err != nil {
+	if err := updateJoinInfo(container.NetworkSettings, n, ep); err != nil {
 		return fmt.Errorf("Updating join info failed: %v", err)
 	}
 
@@ -806,6 +838,37 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 
 	daemon.LogNetworkEventWithAttributes(n, "connect", map[string]string{"container": container.ID})
 	networkActions.WithValues("connect").UpdateSince(start)
+	return nil
+}
+
+func updateJoinInfo(networkSettings *network.Settings, n libnetwork.Network, ep libnetwork.Endpoint) error {
+	if ep == nil {
+		return errors.New("invalid enppoint whhile building portmap info")
+	}
+
+	if networkSettings == nil {
+		return errors.New("invalid network settings while building port map info")
+	}
+
+	if len(networkSettings.Ports) == 0 {
+		pm, err := getEndpointPortMapInfo(ep)
+		if err != nil {
+			return err
+		}
+		networkSettings.Ports = pm
+	}
+
+	epInfo := ep.Info()
+	if epInfo == nil {
+		// It is not an error to get an empty endpoint info
+		return nil
+	}
+	if epInfo.Gateway() != nil {
+		networkSettings.Networks[n.Name()].Gateway = epInfo.Gateway().String()
+	}
+	if epInfo.GatewayIPv6().To16() != nil {
+		networkSettings.Networks[n.Name()].IPv6Gateway = epInfo.GatewayIPv6().String()
+	}
 	return nil
 }
 
@@ -1017,8 +1080,6 @@ func (daemon *Daemon) ConnectToNetwork(container *container.Container, idOrName 
 				EndpointSettings: endpointConfig,
 			}
 		}
-	} else if !daemon.isNetworkHotPluggable() {
-		return fmt.Errorf(runtime.GOOS + " does not support connecting a running container to a network")
 	} else {
 		if err := daemon.connectToNetwork(container, idOrName, endpointConfig, true); err != nil {
 			return err
@@ -1047,8 +1108,6 @@ func (daemon *Daemon) DisconnectFromNetwork(container *container.Container, netw
 			return fmt.Errorf("container %s is not connected to the network %s", container.ID, networkName)
 		}
 		delete(container.NetworkSettings.Networks, networkName)
-	} else if err == nil && !daemon.isNetworkHotPluggable() {
-		return fmt.Errorf(runtime.GOOS + " does not support connecting a running container to a network")
 	} else if err == nil {
 		if container.HostConfig.NetworkMode.IsHost() && containertypes.NetworkMode(n.Type()).IsHost() {
 			return runconfig.ErrConflictHostNetwork
@@ -1109,4 +1168,11 @@ func getNetworkID(name string, endpointSettings *networktypes.EndpointSettings) 
 		return endpointSettings.NetworkID
 	}
 	return name
+}
+
+// updateSandboxNetworkSettings updates the sandbox ID and Key.
+func updateSandboxNetworkSettings(c *container.Container, sb libnetwork.Sandbox) error {
+	c.NetworkSettings.SandboxID = sb.ID()
+	c.NetworkSettings.SandboxKey = sb.Key()
+	return nil
 }

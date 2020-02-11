@@ -7,13 +7,12 @@ import (
 	"testing"
 
 	"github.com/docker/docker/daemon/discovery"
-	"github.com/docker/docker/internal/testutil"
 	"github.com/docker/docker/opts"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
-	"github.com/gotestyourself/gotestyourself/fs"
-	"github.com/gotestyourself/gotestyourself/skip"
 	"github.com/spf13/pflag"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/fs"
+	"gotest.tools/v3/skip"
 )
 
 func TestDaemonConfigurationNotFound(t *testing.T) {
@@ -62,10 +61,7 @@ func TestFindConfigurationConflicts(t *testing.T) {
 
 	flags.String("authorization-plugins", "", "")
 	assert.Check(t, flags.Set("authorization-plugins", "asdf"))
-
-	testutil.ErrorContains(t,
-		findConfigurationConflicts(config, flags),
-		"authorization-plugins: (from flag: asdf, from file: foobar)")
+	assert.Check(t, is.ErrorContains(findConfigurationConflicts(config, flags), "authorization-plugins: (from flag: asdf, from file: foobar)"))
 }
 
 func TestFindConfigurationConflictsWithNamedOptions(t *testing.T) {
@@ -76,8 +72,7 @@ func TestFindConfigurationConflictsWithNamedOptions(t *testing.T) {
 	flags.VarP(opts.NewNamedListOptsRef("hosts", &hosts, opts.ValidateHost), "host", "H", "Daemon socket(s) to connect to")
 	assert.Check(t, flags.Set("host", "tcp://127.0.0.1:4444"))
 	assert.Check(t, flags.Set("host", "unix:///var/run/docker.sock"))
-
-	testutil.ErrorContains(t, findConfigurationConflicts(config, flags), "hosts")
+	assert.Check(t, is.ErrorContains(findConfigurationConflicts(config, flags), "hosts"))
 }
 
 func TestDaemonConfigurationMergeConflicts(t *testing.T) {
@@ -193,104 +188,182 @@ func TestFindConfigurationConflictsWithMergedValues(t *testing.T) {
 	}
 }
 
+func TestValidateReservedNamespaceLabels(t *testing.T) {
+	for _, validLabels := range [][]string{
+		nil, // no error if there are no labels
+		{ // no error if there aren't any reserved namespace labels
+			"hello=world",
+			"label=me",
+		},
+		{ // only reserved namespaces that end with a dot are invalid
+			"com.dockerpsychnotreserved.label=value",
+			"io.dockerproject.not=reserved",
+			"org.docker.not=reserved",
+		},
+	} {
+		assert.Check(t, ValidateReservedNamespaceLabels(validLabels))
+	}
+
+	for _, invalidLabel := range []string{
+		"com.docker.feature=enabled",
+		"io.docker.configuration=0",
+		"org.dockerproject.setting=on",
+		// casing doesn't matter
+		"COM.docker.feature=enabled",
+		"io.DOCKER.CONFIGURATION=0",
+		"Org.Dockerproject.Setting=on",
+	} {
+		err := ValidateReservedNamespaceLabels([]string{
+			"valid=label",
+			invalidLabel,
+			"another=valid",
+		})
+		assert.Check(t, is.ErrorContains(err, invalidLabel))
+	}
+}
+
 func TestValidateConfigurationErrors(t *testing.T) {
-	minusNumber := -10
+	intPtr := func(i int) *int { return &i }
+
 	testCases := []struct {
-		config *Config
+		name        string
+		config      *Config
+		expectedErr string
 	}{
 		{
+			name: "single label without value",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					Labels: []string{"one"},
 				},
 			},
+			expectedErr: "bad attribute format: one",
 		},
 		{
+			name: "multiple label without value",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					Labels: []string{"foo=bar", "one"},
 				},
 			},
+			expectedErr: "bad attribute format: one",
 		},
 		{
+			name: "single DNS, invalid IP-address",
 			config: &Config{
 				CommonConfig: CommonConfig{
-					DNS: []string{"1.1.1.1o"},
-				},
-			},
-		},
-		{
-			config: &Config{
-				CommonConfig: CommonConfig{
-					DNS: []string{"2.2.2.2", "1.1.1.1o"},
-				},
-			},
-		},
-		{
-			config: &Config{
-				CommonConfig: CommonConfig{
-					DNSSearch: []string{"123456"},
-				},
-			},
-		},
-		{
-			config: &Config{
-				CommonConfig: CommonConfig{
-					DNSSearch: []string{"a.b.c", "123456"},
-				},
-			},
-		},
-		{
-			config: &Config{
-				CommonConfig: CommonConfig{
-					MaxConcurrentDownloads: &minusNumber,
-					// This is weird...
-					ValuesSet: map[string]interface{}{
-						"max-concurrent-downloads": -1,
+					DNSConfig: DNSConfig{
+						DNS: []string{"1.1.1.1o"},
 					},
 				},
 			},
+			expectedErr: "1.1.1.1o is not an ip address",
 		},
 		{
+			name: "multiple DNS, invalid IP-address",
 			config: &Config{
 				CommonConfig: CommonConfig{
-					MaxConcurrentUploads: &minusNumber,
-					// This is weird...
-					ValuesSet: map[string]interface{}{
-						"max-concurrent-uploads": -1,
+					DNSConfig: DNSConfig{
+						DNS: []string{"2.2.2.2", "1.1.1.1o"},
 					},
 				},
 			},
+			expectedErr: "1.1.1.1o is not an ip address",
 		},
 		{
+			name: "single DNSSearch",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					DNSConfig: DNSConfig{
+						DNSSearch: []string{"123456"},
+					},
+				},
+			},
+			expectedErr: "123456 is not a valid domain",
+		},
+		{
+			name: "multiple DNSSearch",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					DNSConfig: DNSConfig{
+						DNSSearch: []string{"a.b.c", "123456"},
+					},
+				},
+			},
+			expectedErr: "123456 is not a valid domain",
+		},
+		{
+			name: "negative max-concurrent-downloads",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxConcurrentDownloads: intPtr(-10),
+				},
+			},
+			expectedErr: "invalid max concurrent downloads: -10",
+		},
+		{
+			name: "negative max-concurrent-uploads",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxConcurrentUploads: intPtr(-10),
+				},
+			},
+			expectedErr: "invalid max concurrent uploads: -10",
+		},
+		{
+			name: "negative max-download-attempts",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxDownloadAttempts: intPtr(-10),
+				},
+			},
+			expectedErr: "invalid max download attempts: -10",
+		},
+		{
+			name: "zero max-download-attempts",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxDownloadAttempts: intPtr(0),
+				},
+			},
+			expectedErr: "invalid max download attempts: 0",
+		},
+		{
+			name: "generic resource without =",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					NodeGenericResources: []string{"foo"},
 				},
 			},
+			expectedErr: "could not parse GenericResource: incorrect term foo, missing '=' or malformed expression",
 		},
 		{
+			name: "generic resource mixed named and discrete",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					NodeGenericResources: []string{"foo=bar", "foo=1"},
 				},
 			},
+			expectedErr: "could not parse GenericResource: mixed discrete and named resources in expression 'foo=[bar 1]'",
 		},
 	}
 	for _, tc := range testCases {
-		err := Validate(tc.config)
-		if err == nil {
-			t.Fatalf("expected error, got nil for config %v", tc.config)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := Validate(tc.config)
+			assert.Error(t, err, tc.expectedErr)
+		})
 	}
 }
 
 func TestValidateConfiguration(t *testing.T) {
-	minusNumber := 4
+	intPtr := func(i int) *int { return &i }
+
 	testCases := []struct {
+		name   string
 		config *Config
 	}{
 		{
+			name: "with label",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					Labels: []string{"one=two"},
@@ -298,42 +371,51 @@ func TestValidateConfiguration(t *testing.T) {
 			},
 		},
 		{
+			name: "with dns",
 			config: &Config{
 				CommonConfig: CommonConfig{
-					DNS: []string{"1.1.1.1"},
-				},
-			},
-		},
-		{
-			config: &Config{
-				CommonConfig: CommonConfig{
-					DNSSearch: []string{"a.b.c"},
-				},
-			},
-		},
-		{
-			config: &Config{
-				CommonConfig: CommonConfig{
-					MaxConcurrentDownloads: &minusNumber,
-					// This is weird...
-					ValuesSet: map[string]interface{}{
-						"max-concurrent-downloads": -1,
+					DNSConfig: DNSConfig{
+						DNS: []string{"1.1.1.1"},
 					},
 				},
 			},
 		},
 		{
+			name: "with dns-search",
 			config: &Config{
 				CommonConfig: CommonConfig{
-					MaxConcurrentUploads: &minusNumber,
-					// This is weird...
-					ValuesSet: map[string]interface{}{
-						"max-concurrent-uploads": -1,
+					DNSConfig: DNSConfig{
+						DNSSearch: []string{"a.b.c"},
 					},
 				},
 			},
 		},
 		{
+			name: "with max-concurrent-downloads",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxConcurrentDownloads: intPtr(4),
+				},
+			},
+		},
+		{
+			name: "with max-concurrent-uploads",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxConcurrentUploads: intPtr(4),
+				},
+			},
+		},
+		{
+			name: "with max-download-attempts",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					MaxDownloadAttempts: intPtr(4),
+				},
+			},
+		},
+		{
+			name: "with multiple node generic resources",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					NodeGenericResources: []string{"foo=bar", "foo=baz"},
@@ -341,6 +423,7 @@ func TestValidateConfiguration(t *testing.T) {
 			},
 		},
 		{
+			name: "with node generic resources",
 			config: &Config{
 				CommonConfig: CommonConfig{
 					NodeGenericResources: []string{"foo=1"},
@@ -349,10 +432,10 @@ func TestValidateConfiguration(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		err := Validate(tc.config)
-		if err != nil {
-			t.Fatalf("expected no error, got error %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := Validate(tc.config)
+			assert.NilError(t, err)
+		})
 	}
 }
 
@@ -426,14 +509,13 @@ func TestReloadSetConfigFileNotExist(t *testing.T) {
 	flags.Set("config-file", configFile)
 
 	err := Reload(configFile, flags, func(c *Config) {})
-	assert.Check(t, is.ErrorContains(err, ""))
-	testutil.ErrorContains(t, err, "unable to configure the Docker daemon with file")
+	assert.Check(t, is.ErrorContains(err, "unable to configure the Docker daemon with file"))
 }
 
 // TestReloadDefaultConfigNotExist tests that if the default configuration file
 // doesn't exist the daemon still will be reloaded.
 func TestReloadDefaultConfigNotExist(t *testing.T) {
-	skip.IfCondition(t, os.Getuid() != 0, "skipping test that requires root")
+	skip.If(t, os.Getuid() != 0, "skipping test that requires root")
 	reloaded := false
 	configFile := "/etc/docker/daemon.json"
 	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
@@ -460,8 +542,7 @@ func TestReloadBadDefaultConfig(t *testing.T) {
 	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
 	flags.String("config-file", configFile, "")
 	err = Reload(configFile, flags, func(c *Config) {})
-	assert.Check(t, is.ErrorContains(err, ""))
-	testutil.ErrorContains(t, err, "unable to configure the Docker daemon with file")
+	assert.Check(t, is.ErrorContains(err, "unable to configure the Docker daemon with file"))
 }
 
 func TestReloadWithConflictingLabels(t *testing.T) {
@@ -474,7 +555,7 @@ func TestReloadWithConflictingLabels(t *testing.T) {
 	flags.String("config-file", configFile, "")
 	flags.StringSlice("labels", lbls, "")
 	err := Reload(configFile, flags, func(c *Config) {})
-	testutil.ErrorContains(t, err, "conflict labels for foo=baz and foo=bar")
+	assert.Check(t, is.ErrorContains(err, "conflict labels for foo=baz and foo=bar"))
 }
 
 func TestReloadWithDuplicateLabels(t *testing.T) {
